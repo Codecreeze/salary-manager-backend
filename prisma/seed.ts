@@ -1,9 +1,11 @@
-import { PrismaClient, JobLevel, SalaryChangeReason } from '@prisma/client';
+import { JobLevel, SalaryChangeReason, type Prisma } from '@prisma/client';
 import { faker } from '@faker-js/faker';
+import { createId } from '@paralleldrive/cuid2';
+import { createPrismaClient } from './create-prisma-client';
 
 faker.seed(42);
 
-const prisma = new PrismaClient();
+const prisma = createPrismaClient();
 
 const DEPARTMENTS = [
   'Engineering',
@@ -91,6 +93,17 @@ const REASON_POOL: SalaryChangeReason[] = [
   'CORRECTION',
 ];
 
+/** Inserts `rows` via `createMany` in fixed-size chunks — keeps each network round-trip small and predictable regardless of how far away the database is. */
+async function insertInChunks<T>(
+  rows: T[],
+  chunkSize: number,
+  insert: (chunk: T[]) => Promise<unknown>,
+): Promise<void> {
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    await insert(rows.slice(i, i + chunkSize));
+  }
+}
+
 async function main() {
   console.log('Seeding database...');
 
@@ -99,26 +112,27 @@ async function main() {
   await prisma.country.deleteMany();
   await prisma.department.deleteMany();
 
-  const departments = await Promise.all(
-    DEPARTMENTS.map((name) => prisma.department.create({ data: { name } })),
-  );
+  // IDs are generated client-side (matches the schema's @default(cuid())
+  // format) so the whole dataset can be built in memory first, then written
+  // in a handful of batched `createMany` calls instead of one round-trip per
+  // row — the difference between seconds and tens of minutes once the
+  // database is remote rather than a local file.
+  const departments = DEPARTMENTS.map((name) => ({ id: createId(), name }));
+  const countries = COUNTRIES.map(({ name, code }) => ({ id: createId(), name, code }));
 
-  const countries = await Promise.all(
-    COUNTRIES.map(({ name, code }) =>
-      prisma.country.create({ data: { name, code } }),
-    ),
-  );
-  const countryCurrency = new Map(
-    COUNTRIES.map((c) => [c.code, c.currency] as const),
-  );
-  const countryByCode = new Map(
-    countries.map((c, i) => [COUNTRIES[i].code, c] as const),
-  );
+  await prisma.department.createMany({ data: departments });
+  await prisma.country.createMany({ data: countries });
+
+  const countryCurrency = new Map(COUNTRIES.map((c) => [c.code, c.currency] as const));
+  const countryByCode = new Map(countries.map((c, i) => [COUNTRIES[i].code, c] as const));
 
   const EMPLOYEE_COUNT = 10_000;
   const managerCandidateIds: { id: string; level: JobLevel }[] = [];
 
-  console.log(`Creating ${EMPLOYEE_COUNT} employees...`);
+  console.log(`Generating ${EMPLOYEE_COUNT} employees...`);
+
+  const employeeRows: Prisma.EmployeeCreateManyInput[] = [];
+  const salaryRecordRows: Prisma.SalaryRecordCreateManyInput[] = [];
 
   for (let i = 1; i <= EMPLOYEE_COUNT; i++) {
     const level = pickLevel();
@@ -136,46 +150,45 @@ async function main() {
 
     const hireDate = faker.date.past({ years: 8 });
 
-    // Pick a manager from a higher-level employee already created, when
-    // available, so the org hierarchy is plausible (managers created earlier
-    // in the loop, higher level).
+    // Pick a manager from a higher-level employee already generated, when
+    // available, so the org hierarchy is plausible (managers appear earlier
+    // in the sequence, at a higher level).
     let managerId: string | null = null;
     if (level !== 'L6' && managerCandidateIds.length > 0) {
-      const higherLevelManagers = managerCandidateIds.filter(
-        (m) => m.level > level,
-      );
+      const higherLevelManagers = managerCandidateIds.filter((m) => m.level > level);
       if (higherLevelManagers.length > 0 && faker.datatype.boolean(0.85)) {
         managerId = faker.helpers.arrayElement(higherLevelManagers).id;
       }
     }
 
     const initialAmount = salaryForLevelAndCountry(level, countryMeta.code);
+    const employeeId = createId();
 
-    const employee = await prisma.employee.create({
-      data: {
-        employeeCode,
-        firstName,
-        lastName,
-        email,
-        departmentId: department.id,
-        countryId: country.id,
-        jobLevel: level,
-        employmentStatus: faker.datatype.boolean(0.95) ? 'ACTIVE' : 'INACTIVE',
-        managerId,
-        hireDate,
-        salaryRecords: {
-          create: {
-            amount: initialAmount,
-            currency,
-            effectiveDate: hireDate,
-            reason: 'HIRE',
-          },
-        },
-      },
+    employeeRows.push({
+      id: employeeId,
+      employeeCode,
+      firstName,
+      lastName,
+      email,
+      departmentId: department.id,
+      countryId: country.id,
+      jobLevel: level,
+      employmentStatus: faker.datatype.boolean(0.95) ? 'ACTIVE' : 'INACTIVE',
+      managerId,
+      hireDate,
+    });
+
+    salaryRecordRows.push({
+      id: createId(),
+      employeeId,
+      amount: initialAmount,
+      currency,
+      effectiveDate: hireDate,
+      reason: 'HIRE',
     });
 
     if (level === 'L4' || level === 'L5' || level === 'L6') {
-      managerCandidateIds.push({ id: employee.id, level });
+      managerCandidateIds.push({ id: employeeId, level });
     }
 
     // For a meaningful subset (~20%), add extra salary-history events after
@@ -186,29 +199,20 @@ async function main() {
       let lastDate = hireDate;
 
       for (let e = 0; e < eventCount; e++) {
-        const nextDate = faker.date.between({
-          from: lastDate,
-          to: new Date(),
-        });
+        const nextDate = faker.date.between({ from: lastDate, to: new Date() });
         if (nextDate <= lastDate) continue;
 
-        const raisePct = faker.number.float({
-          min: 0.03,
-          max: 0.18,
-          fractionDigits: 3,
-        });
+        const raisePct = faker.number.float({ min: 0.03, max: 0.18, fractionDigits: 3 });
         const roundTo = (COUNTRY_MULTIPLIER[countryMeta.code] ?? 1) >= 10 ? 1000 : 100;
-        const nextAmount =
-          Math.round((lastAmount * (1 + raisePct)) / roundTo) * roundTo;
+        const nextAmount = Math.round((lastAmount * (1 + raisePct)) / roundTo) * roundTo;
 
-        await prisma.salaryRecord.create({
-          data: {
-            employeeId: employee.id,
-            amount: nextAmount,
-            currency,
-            effectiveDate: nextDate,
-            reason: faker.helpers.arrayElement(REASON_POOL),
-          },
+        salaryRecordRows.push({
+          id: createId(),
+          employeeId,
+          amount: nextAmount,
+          currency,
+          effectiveDate: nextDate,
+          reason: faker.helpers.arrayElement(REASON_POOL),
         });
 
         lastAmount = nextAmount;
@@ -216,10 +220,20 @@ async function main() {
       }
     }
 
-    if (i % 1000 === 0) {
-      console.log(`  ...${i} employees created`);
+    if (i % 2000 === 0) {
+      console.log(`  ...${i} employees generated`);
     }
   }
+
+  console.log(`Writing ${employeeRows.length} employees in batches...`);
+  await insertInChunks(employeeRows, 500, (chunk) =>
+    prisma.employee.createMany({ data: chunk }),
+  );
+
+  console.log(`Writing ${salaryRecordRows.length} salary records in batches...`);
+  await insertInChunks(salaryRecordRows, 500, (chunk) =>
+    prisma.salaryRecord.createMany({ data: chunk }),
+  );
 
   const employeeCount = await prisma.employee.count();
   const salaryRecordCount = await prisma.salaryRecord.count();
