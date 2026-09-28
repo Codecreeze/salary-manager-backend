@@ -2,6 +2,9 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// Provider stays "sqlite" even for Turso: Turso *is* SQLite/libSQL under the
+// hood, reached over the network via the driver adapter configured in
+// PrismaService instead of a bare file path.
 datasource db {
   provider = "sqlite"
   url      = env("DATABASE_URL")
