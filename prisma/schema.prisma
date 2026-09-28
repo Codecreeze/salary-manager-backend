@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum JobLevel {
+  L1
+  L2
+  L3
+  L4
+  L5
+  L6
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum SalaryChangeReason {
+  HIRE
+  PROMOTION
+  MERIT
+  MARKET_ADJUSTMENT
+  CORRECTION
+}
+
+model Department {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  employees Employee[]
+}
+
+model Country {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  code      String     @unique
+  employees Employee[]
+}
+
+model Employee {
+  id               String           @id @default(cuid())
+  employeeCode     String           @unique
+  firstName        String
+  lastName         String
+  email            String           @unique
+  departmentId     String
+  department       Department       @relation(fields: [departmentId], references: [id])
+  countryId        String
+  country          Country          @relation(fields: [countryId], references: [id])
+  jobLevel         JobLevel
+  employmentStatus EmploymentStatus @default(ACTIVE)
+  managerId        String?
+  manager          Employee?        @relation("EmployeeManager", fields: [managerId], references: [id])
+  directReports    Employee[]       @relation("EmployeeManager")
+  hireDate         DateTime
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  salaryRecords SalaryRecord[]
+
+  @@index([departmentId])
+  @@index([countryId])
+}
+
+model SalaryRecord {
+  id            String              @id @default(cuid())
+  employeeId    String
+  employee      Employee            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  amount        Int
+  currency      String
+  effectiveDate DateTime
+  reason        SalaryChangeReason
+  createdAt     DateTime            @default(now())
+
+  @@index([employeeId, effectiveDate])
+}
